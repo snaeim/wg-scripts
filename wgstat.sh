@@ -19,49 +19,81 @@ ERR_NO_INTERFACES_FOUND=20
 
 # Function to calculate time difference
 time_diff() {
-  local timestamp=$1
-  [[ -z "$timestamp" ]] || [[ ! "$timestamp" =~ ^[0-9]+$ ]] && return $ERR_INVALID_TIMESTAMP
-    
-  local diff=$(($(date +%s) - timestamp))
+  local ts=$1 now diff n r c=0
+  [[ -z "$ts" ]] || [[ ! "$ts" =~ ^[0-9]+$ ]] && return ${ERR_INVALID_TIMESTAMP:-1}
+  
+  now=$(date +%s)
+  diff=$((now - ts))
   ((diff == 0)) && echo "Just now" && return 0
-
-  local out="" count=0
-  local -A units=([month]=2592000 [day]=86400 [hour]=3600 [minute]=60 [second]=1)
-  for unit in month day hour minute second; do
-    ((count == 3)) && break
-    local val=$((diff / units[$unit]))
-    diff=$((diff % units[$unit]))
-    ((val == 0)) && continue
-    [[ -n $out ]] && out+=", "
-    out+="$val $unit"
-    ((val > 1)) && out+="s"
-    ((count++))
-  done
-
-  echo "$out ago"
+  
+  # Hardcoded values to avoid array lookups and string splitting
+  n=$((diff / 2592000))
+  if ((n > 0)); then
+    r="$n month"
+    ((n > 1)) && r+="s"
+    diff=$((diff % 2592000))
+    c=1
+  fi
+  
+  n=$((diff / 86400))
+  if ((n > 0 && c < 2)); then
+    [[ -n "$r" ]] && r+=", "
+    r+="$n day"
+    ((n > 1)) && r+="s"
+    diff=$((diff % 86400))
+    ((c++))
+  fi
+  
+  n=$((diff / 3600))
+  if ((n > 0 && c < 2)); then
+    [[ -n "$r" ]] && r+=", "
+    r+="$n hour"
+    ((n > 1)) && r+="s"
+    diff=$((diff % 3600))
+    ((c++))
+  fi
+  
+  n=$((diff / 60))
+  if ((n > 0 && c < 2)); then
+    [[ -n "$r" ]] && r+=", "
+    r+="$n minute"
+    ((n > 1)) && r+="s"
+    diff=$((diff % 60))
+    ((c++))
+  fi
+  
+  if ((diff > 0 && c < 2)); then
+    [[ -n "$r" ]] && r+=", "
+    r+="$diff second"
+    ((diff > 1)) && r+="s"
+  fi
+  
+  echo "$r ago"
   return 0
 }
 
 format_iec() {
-  local bytes=$1
-  [[ -z "$bytes" || "$bytes" =~ [^0-9] ]] && return $ERR_INVALID_BYTES
-  local units=("B" "KiB" "MiB" "GiB" "TiB")
-  local thresholds=(1 1024 1048576 1073741824 1099511627776)
+  local b=$1
+  [[ -z "$b" || "$b" =~ [^0-9] ]] && return ${ERR_INVALID_BYTES:-1}
   
-  # Special case for bytes (no decimal places needed)
-  if ((bytes < 1024)); then
-    echo "$bytes ${units[0]}"
+  # Special case for bytes
+  if ((b < 1024)); then
+    echo "$b B"
     return 0
   fi
   
-  # For KiB and above, use decimal places
-  for i in {1..4}; do
-    if ((bytes < thresholds[i+1])) || ((i == 4)); then
-      local size=$(awk "BEGIN {printf \"%.2f\", $bytes / ${thresholds[$i]}}")
-      echo "${size} ${units[$i]}"
-      return 0
-    fi
-  done
+  # Direct calculation without arrays or loops
+  if ((b < 1048576)); then  # Under MiB
+    echo "$(awk "BEGIN {printf \"%.2f\", $b / 1024}") KiB"
+  elif ((b < 1073741824)); then  # Under GiB
+    echo "$(awk "BEGIN {printf \"%.2f\", $b / 1048576}") MiB"
+  elif ((b < 1099511627776)); then  # Under TiB
+    echo "$(awk "BEGIN {printf \"%.2f\", $b / 1073741824}") GiB"
+  else  # TiB or larger
+    echo "$(awk "BEGIN {printf \"%.2f\", $b / 1099511627776}") TiB"
+  fi
+  
+  return 0
 }
 
 # Function to update WireGuard interface
@@ -165,6 +197,8 @@ update_interface() {
 
 show_interface() {
   local interface_name="$1"
+  local format="${2:-plain}"  # Default to plain if no format specified
+  
   [[ -z "$interface_name" ]] && return $ERR_INTERFACE_NAME_REQUIRED
 
   local file_path="$DB_PATH/$interface_name.json"
@@ -181,180 +215,122 @@ show_interface() {
     [(. | map(select(.value.latest_handshake == 0)) | [.[].key])] | 
     flatten | join(" ")) ' <<< "$json_data")
   
-  # Use arrays instead of string concatenation
-  local interface_output=()
-  local peers_output=()
-
+  # Initialize variables
   local total_interface_rx=0
   local total_interface_tx=0
 
-  interface_output+=("interface: $name")
-  interface_output+=("  public key: $public_key")
-  interface_output+=("  listening port: $listen_port")
-  interface_output+=("  recorded since: $(time_diff $create_at)")
-  interface_output+=("  last updated: $(time_diff $update_at)")
-
-  for peer in $peers; do
-    local endpoint allowed_ips latest_handshake total_rx total_tx
-    read -r endpoint allowed_ips latest_handshake total_rx total_tx < <(
-      jq -r ".peers[\"$peer\"] | \"\(.endpoint) \(.allowed_ips) \(.latest_handshake) \(.total_rx) \(.total_tx)\"" <<< "$json_data"
-    )
-
-    total_interface_rx=$((total_interface_rx + total_rx))
-    total_interface_tx=$((total_interface_tx + total_tx))
-
-    peers_output+=("")
-    peers_output+=("peer: $peer")
-    [[ "$endpoint" != "(none)" ]] && peers_output+=("  endpoint: $endpoint")
-    peers_output+=("  allowed ips: $allowed_ips")
-    [[ "$latest_handshake" -ne 0 ]] && peers_output+=("  latest handshake: $(time_diff $latest_handshake)")
-    [[ $total_rx -ne 0 || $total_tx -ne 0 ]] && peers_output+=("  transfer: $(format_iec $total_rx) received, $(format_iec $total_tx) sent")
-  done
-
-  # Add total interface transfer
-  interface_output+=("  transfer: $(format_iec $total_interface_rx) received, $(format_iec $total_interface_tx) sent")
-
-  # Print the final output
-  printf "%s\n" "${interface_output[@]}"
-  printf "%s\n" "${peers_output[@]}"
-
-  return 0
-}
-
-show_interface_colorized() {
-  local interface_name="$1"
-  [[ -z "$interface_name" ]] && return $ERR_INTERFACE_NAME_REQUIRED
-
-  local file_path="$DB_PATH/$interface_name.json"
-  [[ -f "$file_path" ]] || return $ERR_FILE_NOT_FOUND
-  
-  local json_data=$(<"$file_path")
-
-  local name public_key listen_port create_at update_at peers
-  read -r name public_key listen_port create_at update_at peers < <(jq -r '
-    (.interface | "\(.name) \(.public_key) \(.listen_port) \(.create_at) \(.update_at) ") + 
-    (.peers | to_entries | 
-    [(. | map(select(.value.latest_handshake > 0))) | sort_by(.value.latest_handshake) | reverse | [.[].key]] + 
-    # Then add peers with latest_handshake == 0 
-    [(. | map(select(.value.latest_handshake == 0)) | [.[].key])] | 
-    flatten | join(" ")) ' <<< "$json_data")
-  
-  # Use arrays instead of string concatenation
-  local interface_output=()
-  local peers_output=()
-
-  local total_interface_rx=0
-  local total_interface_tx=0
-
-  interface_output+=("\e[1;32minterface:\e[0m \e[32m$name\e[0m")
-  interface_output+=("  \e[1;37mpublic key:\e[0m \e[37m$public_key\e[0m")
-  interface_output+=("  \e[1;37mlistening port:\e[0m \e[37m$listen_port\e[0m")
-  interface_output+=("  \e[1;37mrecorded since:\e[0m \e[37m$(time_diff $create_at)\e[0m")
-  interface_output+=("  \e[1;37mlast updated:\e[0m \e[37m$(time_diff $update_at)\e[0m")
-
-  for peer in $peers; do
-    local endpoint allowed_ips latest_handshake total_rx total_tx
-    read -r endpoint allowed_ips latest_handshake total_rx total_tx < <(
-      jq -r ".peers[\"$peer\"] | \"\(.endpoint) \(.allowed_ips) \(.latest_handshake) \(.total_rx) \(.total_tx)\"" <<< "$json_data"
-    )
-
-    total_interface_rx=$((total_interface_rx + total_rx))
-    total_interface_tx=$((total_interface_tx + total_tx))
-
-    peers_output+=("")
-    peers_output+=("\e[1;33mpeer:\e[0m \e[33m$peer\e[0m")
-    [[ "$endpoint" != "(none)" ]] && peers_output+=("  \e[1;37mendpoint:\e[0m \e[37m$endpoint\e[0m")
-    peers_output+=("  \e[1;37mallowed ips:\e[0m \e[37m$allowed_ips\e[0m")
-    [[ "$latest_handshake" -ne 0 ]] && peers_output+=("  \e[1;37mlatest handshake:\e[0m \e[37m$(time_diff $latest_handshake)\e[0m")
-    [[ $total_rx -ne 0 || $total_tx -ne 0 ]] && peers_output+=("  \e[1;37mtransfer:\e[0m \e[37m$(format_iec $total_rx) received, $(format_iec $total_tx) sent\e[0m")
-  done
-
-  # Add total interface transfer
-  interface_output+=("  \e[1;37mtransfer:\e[0m \e[37m$(format_iec $total_interface_rx) received, $(format_iec $total_interface_tx) sent\e[0m")
-
-  # Print the final output
-  printf "%b\n" "${interface_output[@]}"
-  printf "%b\n" "${peers_output[@]}"
-
-  return 0
-}
-
-show_interface_json() {
-  local interface_name="$1"
-  [[ -z "$interface_name" ]] && return $ERR_INTERFACE_NAME_REQUIRED
-  local file_path="$DB_PATH/$interface_name.json"
-  [[ -f "$file_path" ]] || return $ERR_FILE_NOT_FOUND
- 
-  local json_data=$(<"$file_path")
-  local name public_key listen_port create_at update_at peers
-  read -r name public_key listen_port create_at update_at peers < <(jq -r '
-    (.interface | "\(.name) \(.public_key) \(.listen_port) \(.create_at) \(.update_at) ") +
-    (.peers | to_entries |
-    [(. | map(select(.value.latest_handshake > 0))) | sort_by(.value.latest_handshake) | reverse | [.[].key]] +
-    # Then add peers with latest_handshake == 0
-    [(. | map(select(.value.latest_handshake == 0)) | [.[].key])] |
-    flatten | join(" ")) ' <<< "$json_data")
-  
-  # Initialize total interface transfer values
-  local total_interface_rx=0
-  local total_interface_tx=0
-
-  # Generate JSON object for output
-  local output_json=$(jq -n --arg name "$name" --arg public_key "$public_key" --arg listen_port "$listen_port" \
-    --arg create_at "$(time_diff "$create_at")" --arg update_at "$(time_diff "$update_at")" \
-    --argjson total_interface_rx "$total_interface_rx" --argjson total_interface_tx "$total_interface_tx" '
-    {
-      "interface": {
-        "name": $name,
-        "public_key": $public_key,
-        "listen_port": $listen_port,
-        "create_at": $create_at,
-        "update_at": $update_at,
-        "total_rx": $total_interface_rx,
-        "total_tx": $total_interface_tx
-      },
-      "peers": {}
-    }')
-  # Modify peers value and append to the output JSON object
-  for peer in $peers; do
-    local endpoint allowed_ips latest_handshake total_rx total_tx
-    read -r endpoint allowed_ips latest_handshake total_rx total_tx < <(
-      jq -r ".peers[\"$peer\"] | \"\(.endpoint) \(.allowed_ips) \(.latest_handshake) \(.total_rx) \(.total_tx)\"" <<< "$json_data"
-    )
-    total_interface_rx=$((total_interface_rx + total_rx))
-    total_interface_tx=$((total_interface_tx + total_tx))
+  if [[ "$format" == "json" ]]; then
+    # Generate initial JSON object for output
+    local output_json=$(jq -n --arg name "$name" --arg public_key "$public_key" --arg listen_port "$listen_port" \
+      --arg create_at "$(time_diff "$create_at")" --arg update_at "$(time_diff "$update_at")" '
+      {
+        "interface": {
+          "name": $name,
+          "public_key": $public_key,
+          "listen_port": $listen_port,
+          "create_at": $create_at,
+          "update_at": $update_at
+        },
+        "peers": {}
+      }')
     
-    # Append peer data to the output JSON object, only including fields with meaningful values
-    output_json=$(jq --arg peer "$peer" \
-                     --arg allowed_ips "$allowed_ips" \
-                     --arg endpoint "$endpoint" \
-                     --arg handshake "$([ $latest_handshake -gt 0 ] && time_diff "$latest_handshake" || echo "")" \
-                     --arg rx "$([ $total_rx -gt 0 ] && format_iec "$total_rx" || echo "")" \
-                     --arg tx "$([ $total_tx -gt 0 ] && format_iec "$total_tx" || echo "")" '
-                     .peers[$peer] = (
-                       {
-                         "allowed_ips": $allowed_ips,
-                         "endpoint": $endpoint,
-                         "latest_handshake": $handshake,
-                         "total_rx": $rx,
-                         "total_tx": $tx
-                       } | with_entries(
-                           select(
-                             .value != null and
-                             .value != "" and
-                             .value != "(none)"
+    # Process peer data and calculate totals in the same loop
+    for peer in $peers; do
+      local endpoint allowed_ips latest_handshake total_rx total_tx
+      read -r endpoint allowed_ips latest_handshake total_rx total_tx < <(
+        jq -r ".peers[\"$peer\"] | \"\(.endpoint) \(.allowed_ips) \(.latest_handshake) \(.total_rx) \(.total_tx)\"" <<< "$json_data"
+      )
+      
+      # Update interface totals
+      total_interface_rx=$((total_interface_rx + total_rx))
+      total_interface_tx=$((total_interface_tx + total_tx))
+      
+      # Append peer data to the output JSON object
+      output_json=$(jq --arg peer "$peer" \
+                       --arg allowed_ips "$allowed_ips" \
+                       --arg endpoint "$endpoint" \
+                       --arg handshake "$([ $latest_handshake -gt 0 ] && time_diff "$latest_handshake" || echo "")" \
+                       --arg rx "$([ $total_rx -gt 0 ] && format_iec "$total_rx" || echo "")" \
+                       --arg tx "$([ $total_tx -gt 0 ] && format_iec "$total_tx" || echo "")" '
+                       .peers[$peer] = (
+                         {
+                           "allowed_ips": $allowed_ips,
+                           "endpoint": $endpoint,
+                           "latest_handshake": $handshake,
+                           "total_rx": $rx,
+                           "total_tx": $tx
+                         } | with_entries(
+                             select(
+                               .value != null and
+                               .value != "" and
+                               .value != "(none)"
+                             )
                            )
-                         )
-                     )' <<< "$output_json")
-  done
-  
-  # Update the interface totals with formatted values
-  output_json=$(jq --arg total_rx "$(format_iec $total_interface_rx)" \
-                   --arg total_tx "$(format_iec $total_interface_tx)" '
-                   .interface.total_rx = $total_rx | 
-                   .interface.total_tx = $total_tx' <<< "$output_json")
+                       )' <<< "$output_json")
+    done
     
-  jq -r '.' <<< "$output_json"
+    # Add interface totals after processing all peers
+    output_json=$(jq --arg total_rx "$(format_iec $total_interface_rx)" \
+                     --arg total_tx "$(format_iec $total_interface_tx)" '
+                     .interface.total_rx = $total_rx | 
+                     .interface.total_tx = $total_tx' <<< "$output_json")
+      
+    jq -r '.' <<< "$output_json"
+  
+  else  # Handle both plain and colorized formats
+    # Define color codes based on format
+    local c_intf_label=""
+    local c_intf_value=""
+    local c_label=""
+    local c_value=""
+    local c_peer_label=""
+    local c_peer_value=""
+    local c_reset=""
+    
+    if [[ "$format" == "colorized" ]]; then
+      c_intf_label="\e[1;32m"
+      c_intf_value="\e[32m"
+      c_label="\e[1;37m"
+      c_value="\e[37m"
+      c_peer_label="\e[1;33m"
+      c_peer_value="\e[33m"
+      c_reset="\e[0m"
+    fi
+
+    # Prepare initial interface output - first part (before transfer line)
+    local interface_output=""
+    interface_output+="${c_intf_label}interface:${c_reset} ${c_intf_value}$name${c_reset}\n"
+    interface_output+="  ${c_label}public key:${c_reset} ${c_value}$public_key${c_reset}\n"
+    interface_output+="  ${c_label}listening port:${c_reset} ${c_value}$listen_port${c_reset}\n"
+    interface_output+="  ${c_label}recorded since:${c_reset} ${c_value}$(time_diff $create_at)${c_reset}\n"
+    interface_output+="  ${c_label}last updated:${c_reset} ${c_value}$(time_diff $update_at)${c_reset}"
+
+    # Process peer data and calculate totals
+    local peers_output=""
+    for peer in $peers; do
+      local endpoint allowed_ips latest_handshake total_rx total_tx
+      read -r endpoint allowed_ips latest_handshake total_rx total_tx < <(
+        jq -r ".peers[\"$peer\"] | \"\(.endpoint) \(.allowed_ips) \(.latest_handshake) \(.total_rx) \(.total_tx)\"" <<< "$json_data"
+      )
+
+      # Update interface totals
+      total_interface_rx=$((total_interface_rx + total_rx))
+      total_interface_tx=$((total_interface_tx + total_tx))
+
+      # Add peer data to output
+      peers_output+="\n\n${c_peer_label}peer:${c_reset} ${c_peer_value}$peer${c_reset}"
+      [[ "$endpoint" != "(none)" ]] && peers_output+="\n  ${c_label}endpoint:${c_reset} ${c_value}$endpoint${c_reset}"
+      peers_output+="\n  ${c_label}allowed ips:${c_reset} ${c_value}$allowed_ips${c_reset}"
+      [[ "$latest_handshake" -ne 0 ]] && peers_output+="\n  ${c_label}latest handshake:${c_reset} ${c_value}$(time_diff $latest_handshake)${c_reset}"
+      [[ $total_rx -ne 0 || $total_tx -ne 0 ]] && peers_output+="\n  ${c_label}transfer:${c_reset} ${c_value}$(format_iec $total_rx) received, $(format_iec $total_tx) sent${c_reset}"
+    done
+
+    # Create transfer line with final totals
+    local transfer_line="\n  ${c_label}transfer:${c_reset} ${c_value}$(format_iec $total_interface_rx) received, $(format_iec $total_interface_tx) sent${c_reset}"
+    
+    echo -e "${interface_output}${transfer_line}${peers_output}"
+  fi
+
   return 0
 }
 
@@ -426,52 +402,38 @@ main() {
         interfaces=$(for file in "$DB_PATH"/*.json; do basename "$file" .json; done | tr '\n' ' ')
         [[ -z $interfaces ]] && handle_error $ERR_NO_INTERFACES_FOUND
         echo "$interfaces"
-      elif [[ $print_format == "json" && $interface_name == "all" ]]; then
-        # Enable nullglob to ensure the pattern expands to nothing if no files match
-        shopt -s nullglob
-        interfaces=$(for file in "$DB_PATH"/*.json; do basename "$file" .json; done | tr '\n' ' ')
-        [[ -z $interfaces ]] && handle_error $ERR_NO_INTERFACES_FOUND
-        # Initialize an empty array to hold all interface JSONs
-        local combined_json='{"interfaces": []}'
-        local interface_json=""
-        # Process each interface and append its JSON to the array
-        for iface in $interfaces; do
-          interface_json=$(show_interface_json "$iface") || handle_error $?
-          if [[ -n "$interface_json" ]]; then
-            # Append the interface JSON to our array
-            combined_json=$(jq --argjson interface "$interface_json" '.interfaces += [$interface]' <<< "$combined_json")
-          fi
-        done
-        # Output the final JSON
-        jq -r '.' <<< "$combined_json"
-      elif [[ $print_format == "json" ]]; then
-        show_interface_json "$interface_name" || handle_error $?
-      elif [[ $print_format == "colorized" && $interface_name == "all" ]]; then
-        # Enable nullglob to ensure the pattern expands to nothing if no files match
-        shopt -s nullglob
-        interfaces=$(for file in "$DB_PATH"/*.json; do basename "$file" .json; done | tr '\n' ' ')
-        [[ -z $interfaces ]] && handle_error $ERR_NO_INTERFACES_FOUND
-        local first=true
-        for iface in $interfaces; do
-          $first && first=false || echo "" # Adds a blank line before every interface except the first one
-          show_interface_colorized "$iface"
-          [ $? -eq 0 ] || handle_error $?
-        done
-      elif [[ $print_format == "colorized" ]]; then
-        show_interface_colorized "$interface_name" || handle_error $?
       elif [[ $interface_name == "all" ]]; then
         # Enable nullglob to ensure the pattern expands to nothing if no files match
         shopt -s nullglob
         interfaces=$(for file in "$DB_PATH"/*.json; do basename "$file" .json; done | tr '\n' ' ')
         [[ -z $interfaces ]] && handle_error $ERR_NO_INTERFACES_FOUND
-        local first=true
-        for iface in $interfaces; do
-          $first && first=false || echo "" # Adds a blank line before every interface except the first one
-          show_interface "$iface"
-          [ $? -eq 0 ] || handle_error $?
-        done
+        
+        if [[ $print_format == "json" ]]; then
+          # Initialize an empty array to hold all interface JSONs
+          local combined_json='{"interfaces": []}'
+          local interface_json=""
+          # Process each interface and append its JSON to the array
+          for iface in $interfaces; do
+            interface_json=$(show_interface "$iface" "json") || handle_error $?
+            if [[ -n "$interface_json" ]]; then
+              # Append the interface JSON to our array
+              combined_json=$(jq --argjson interface "$interface_json" '.interfaces += [$interface]' <<< "$combined_json")
+            fi
+          done
+          # Output the final JSON
+          jq -r '.' <<< "$combined_json"
+        else
+          # For both plain and colorized formats, process interfaces one by one
+          local first=true
+          for iface in $interfaces; do
+            $first && first=false || echo "" # Adds a blank line before every interface except the first one
+            show_interface "$iface" "$print_format"
+            [ $? -eq 0 ] || handle_error $?
+          done
+        fi
       else
-        show_interface "$interface_name" || handle_error $?
+        # Show details for a single interface with the specified format
+        show_interface "$interface_name" "$print_format" || handle_error $?
       fi
       ;;
     update)
